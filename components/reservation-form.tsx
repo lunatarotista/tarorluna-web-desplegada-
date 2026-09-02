@@ -48,11 +48,16 @@ export function ReservationForm() {
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
       const response = await fetch("/api/reservas", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data) });
-      const result = await response.json() as { error?: string; reservationKey?: string; paymentUrl?: string };
+      const result = await response.json() as { error?: string; reservationKey?: string; payment?: { url: string; signatureVersion: string; merchantParameters: string; signature: string } };
       if (!response.ok) throw new Error(result.error || "No se pudo registrar la solicitud.");
       setReservationCode(result.reservationKey ?? "");
-      if (result.paymentUrl) window.location.assign(result.paymentUrl);
-      else setStatus("success");
+      if (result.payment) {
+        const paymentForm = document.createElement("form");
+        paymentForm.method = "POST"; paymentForm.action = result.payment.url;
+        const fields = { Ds_SignatureVersion: result.payment.signatureVersion, Ds_MerchantParameters: result.payment.merchantParameters, Ds_Signature: result.payment.signature };
+        Object.entries(fields).forEach(([name, value]) => { const input = document.createElement("input"); input.type = "hidden"; input.name = name; input.value = value; paymentForm.appendChild(input); });
+        document.body.appendChild(paymentForm); paymentForm.submit();
+      } else setStatus("success");
     } catch (error) { setMessage(error instanceof Error ? error.message : "Ha ocurrido un error."); setStatus("error"); }
   }
 
@@ -73,7 +78,7 @@ export function ReservationForm() {
     <div className="form-section"><div className="form-section-title"><span>3</span><div><h2>Tus datos</h2><p>Los usaremos únicamente para gestionar la reserva.</p></div></div><div className="form-grid">
       <label>Nombre y apellidos<input name="name" autoComplete="name" required /></label><label>Correo electrónico<input type="email" name="email" autoComplete="email" required /></label><label>Teléfono<input type="tel" name="phone" autoComplete="tel" required /></label><label className="full-field">Cuéntanos brevemente tu consulta<textarea name="notes" rows={4} maxLength={800} /></label>
     </div><label className="consent"><input type="checkbox" name="consent" value="accepted" required /> Acepto que mis datos se utilicen para gestionar esta solicitud de reserva.</label></div>
-    <div className="payment-preview"><div><span className="payment-icon"><CreditCard /></span><div><h2>Pago seguro con Redsys + Bizum</h2><p>La cita solo se confirma y bloquea en la agenda después de que el banco confirme el pago.</p></div></div><span className="pending-badge">Pago seguro</span></div>
+    <div className="payment-preview"><div><span className="payment-icon"><CreditCard /></span><div><h2>Pago seguro</h2><p>Elige tarjeta o Bizum. La cita solo se confirma después de que Redsys valide el pago.</p><div className="payment-methods"><label><input type="radio" name="paymentMethod" value="card" defaultChecked /> Tarjeta</label><label><input type="radio" name="paymentMethod" value="bizum" /> Bizum</label></div></div></div><span className="pending-badge">Redsys</span></div>
     {status === "error" && <p className="form-error" role="alert">{message}</p>}
     <button className="primary-button submit-button" disabled={status === "sending" || !selectedTime}>{status === "sending" ? "Preparando pago…" : "Reservar y pagar"}<CalendarDays /></button>
     <p className="form-help"><MessageCircle /> WhatsApp Business se activará al añadir el número de empresa.</p>
