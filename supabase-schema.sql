@@ -35,7 +35,7 @@ create table if not exists public.reservations (
   updated_at timestamptz not null default now()
 );
 
--- Bloqueos temporales mientras el cliente completa Redsys/Bizum.
+-- Bloqueos temporales mientras el cliente completa el pago alojado de Stripe.
 create table if not exists public.slot_holds (
   slot_key text primary key,
   reservation_key uuid not null references public.reservations(reservation_key) on delete cascade,
@@ -137,7 +137,7 @@ create or replace function public.create_reservation(
 language plpgsql security definer set search_path = public as $$
 declare
   v_amount integer;
-  v_expiry timestamptz := now() + interval '20 minutes';
+  v_expiry timestamptz := now() + interval '31 minutes';
 begin
   v_amount := case p_duration when 10 then 1000 when 30 then 2500 when 60 then 5000 else null end;
   if v_amount is null then raise exception 'Duración no válida'; end if;
@@ -169,68 +169,49 @@ begin
 end;
 $$;
 
-create or replace function public.confirm_paid_reservation(
+create or replace function public.confirm_stripe_paid_reservation(
   p_reservation_key uuid,
-  p_payment_order text,
-  p_response_code text,
+  p_session_id text,
+  p_event_id text,
   p_slot_keys text[]
 ) returns void
 language plpgsql security definer set search_path = public as $$
+declare
+  v_res public.reservations%rowtype;
 begin
-  -- Redsys puede repetir una notificación: la segunda llamada no duplica nada.
-  if exists (
-    select 1 from public.reservations
-    where reservation_key = p_reservation_key
-      and status = 'paid'
-      and payment_order = p_payment_order
-  ) then
-    return;
-  end if;
-
-  if not exists (
-    select 1 from public.reservations
-    where reservation_key = p_reservation_key
-      and status = 'pending_payment'
-      and expires_at > now()
-  ) then
-    raise exception 'Reserva caducada o no disponible';
-  end if;
-
-  if exists (
-    select 1 from unnest(p_slot_keys) requested(slot_key)
-    where not exists (
-      select 1 from public.slot_holds h
-      where h.slot_key = requested.slot_key
-        and h.reservation_key = p_reservation_key
-        and h.expires_at > now()
-    )
-  ) then
-    raise exception 'El bloqueo temporal de la franja no es válido';
+  select * into v_res from public.reservations where reservation_key = p_reservation_key for update;
+  if not found then raise exception 'Reserva no encontrada'; end if;
+  if v_res.payment_order is distinct from p_session_id then raise exception 'Sesión de pago no válida'; end if;
+  if v_res.status = 'paid' then return; end if;
+  if v_res.status not in ('pending_payment', 'payment_failed') then raise exception 'El estado no permite confirmar el pago'; end if;
+  if coalesce(array_length(p_slot_keys, 1), 0) <> v_res.duration / 10 then raise exception 'Bloques horarios no válidos'; end if;
+  if exists (select 1 from public.booked_slots where slot_key = any(p_slot_keys) and reservation_key <> p_reservation_key) then
+    raise exception 'Conflicto con otra reserva ya pagada' using errcode = '23505';
   end if;
 
   insert into public.payment_events (
     provider, provider_event_id, reservation_key, response_code, verified
   ) values (
-    'redsys', p_payment_order, p_reservation_key, p_response_code, true
+    'stripe', p_event_id, p_reservation_key, 'paid', true
   ) on conflict (provider, provider_event_id) do nothing;
 
   insert into public.booked_slots (slot_key, reservation_key)
-  select unnest(p_slot_keys), p_reservation_key;
+  select unnest(p_slot_keys), p_reservation_key on conflict (slot_key) do nothing;
 
   delete from public.slot_holds where reservation_key = p_reservation_key;
 
   update public.reservations set
     status = 'paid',
-    payment_provider = 'redsys_bizum',
-    payment_order = p_payment_order,
-    payment_response_code = p_response_code,
+    payment_provider = 'stripe_bizum',
+    payment_order = p_session_id,
+    payment_response_code = 'paid',
     paid_at = now()
   where reservation_key = p_reservation_key;
 
   insert into public.audit_log (reservation_key, action, metadata)
   values (
     p_reservation_key, 'payment_confirmed',
-    jsonb_build_object('order', p_payment_order, 'response_code', p_response_code)
+    jsonb_build_object('session_id', p_session_id, 'event_id', p_event_id)
   );
 end;
 $$;
@@ -253,24 +234,23 @@ $$;
 
 revoke all on function public.create_reservation(uuid,text,text,text,text,integer,date,time,text,text[])
   from public, anon, authenticated;
-revoke all on function public.confirm_paid_reservation(uuid,text,text,text[])
+revoke all on function public.confirm_stripe_paid_reservation(uuid,text,text,text[])
   from public, anon, authenticated;
 revoke all on function public.fail_reservation_payment(uuid,text)
   from public, anon, authenticated;
 
 grant execute on function public.create_reservation(uuid,text,text,text,text,integer,date,time,text,text[])
   to service_role;
-grant execute on function public.confirm_paid_reservation(uuid,text,text,text[])
+grant execute on function public.confirm_stripe_paid_reservation(uuid,text,text,text[])
   to service_role;
 grant execute on function public.fail_reservation_payment(uuid,text)
   to service_role;
 
 comment on table public.reservations is 'Reservas privadas de Tarot Luna; acceso exclusivo desde el servidor.';
-comment on table public.slot_holds is 'Bloqueos temporales durante Redsys/Bizum para evitar pagos dobles.';
+comment on table public.slot_holds is 'Bloqueos temporales durante el pago alojado de Stripe.';
 comment on table public.booked_slots is 'Bloques ocupados definitivamente después del pago confirmado.';
 comment on table public.payment_events is 'Notificaciones bancarias verificadas e idempotentes.';
 comment on table public.notification_deliveries is 'Trazabilidad de correo, SMS y WhatsApp sin guardar el mensaje completo.';
 comment on table public.audit_log is 'Auditoría interna de cambios relevantes.';
 
 commit;
-

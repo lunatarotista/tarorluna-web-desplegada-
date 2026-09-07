@@ -1,10 +1,10 @@
 import { hasMinimumNotice, occupiedKeys, slotsForDate } from "@/lib/schedule";
-import { encodeMerchantParameters, getRedsysConfig, redsysEndpoint, REDSYS_SIGNATURE_VERSION, signMerchantParameters } from "@/lib/redsys";
-import { randomInt } from "node:crypto";
+import Stripe from "stripe";
 
-type Payload = { name?: string; email?: string; phone?: string; category?: string; duration?: string; date?: string; time?: string; notes?: string; consent?: string; paymentMethod?: string };
+type Payload = { name?: string; email?: string; phone?: string; category?: string; duration?: string; date?: string; time?: string; notes?: string; consent?: string };
 const allowedCategories = new Set(["amor", "trabajo", "economia", "familia", "general"]);
 const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+const prices: Record<number, number> = { 10: 1000, 30: 2500, 60: 5000 };
 
 function supabaseConfig() {
   const url = process.env.SUPABASE_URL?.replace(/\/$/, "");
@@ -12,8 +12,13 @@ function supabaseConfig() {
   return url && key ? { url, key } : null;
 }
 
-function headers(key: string) {
-  return { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" };
+function headers(key: string) { return { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }; }
+
+async function failPendingReservation(config: { url: string; key: string }, reservationKey: string, reason: string) {
+  await fetch(`${config.url}/rest/v1/rpc/fail_reservation_payment`, {
+    method: "POST", headers: headers(config.key),
+    body: JSON.stringify({ p_reservation_key: reservationKey, p_response_code: reason.slice(0, 120) }),
+  }).catch(() => undefined);
 }
 
 export async function GET(request: Request) {
@@ -36,61 +41,47 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  let reservationKey = "";
+  let database: ReturnType<typeof supabaseConfig> = null;
   try {
     const body = await request.json() as Payload;
-    const name = body.name?.trim() ?? "", email = body.email?.trim().toLowerCase() ?? "", phone = body.phone?.trim() ?? "", category = body.category ?? "", date = body.date ?? "", time = body.time ?? "", notes = body.notes?.trim() ?? "", duration = Number(body.duration), paymentMethod = body.paymentMethod ?? "card";
+    const name = body.name?.trim() ?? "", email = body.email?.trim().toLowerCase() ?? "", phone = body.phone?.trim() ?? "", category = body.category ?? "", date = body.date ?? "", time = body.time ?? "", notes = body.notes?.trim() ?? "", duration = Number(body.duration);
     const validSlot = datePattern.test(date) && slotsForDate(date, duration).includes(time) && hasMinimumNotice(date, time);
-    if (!name || !email.includes("@") || !phone || !allowedCategories.has(category) || !validSlot || body.consent !== "accepted" || !["card", "bizum"].includes(paymentMethod)) return Response.json({ error: "Revisa los datos y recuerda reservar con un mínimo de 24 horas de antelación." }, { status: 400 });
-    const config = supabaseConfig();
-    if (!config) return Response.json({ error: "La agenda todavía no tiene conectada su base de datos. Puedes reservar mediante Google Forms." }, { status: 503 });
-    const redsys = getRedsysConfig();
-    if (!redsys) return Response.json({ error: "El pago seguro todavía no está activado. Contacta con Tarot Luna." }, { status: 503 });
-    const reservationKey = crypto.randomUUID();
-    const response = await fetch(`${config.url}/rest/v1/rpc/create_reservation`, { method: "POST", headers: headers(config.key), body: JSON.stringify({ p_reservation_key: reservationKey, p_name: name, p_email: email, p_phone: phone, p_category: category, p_duration: duration, p_date: date, p_time: time, p_notes: notes.slice(0, 800), p_slot_keys: occupiedKeys(date, time, duration) }) });
+    if (!name || !email.includes("@") || !phone || !allowedCategories.has(category) || !validSlot || body.consent !== "accepted" || !prices[duration]) return Response.json({ error: "Revisa los datos y recuerda reservar con un mínimo de 24 horas de antelación." }, { status: 400 });
+    database = supabaseConfig();
+    if (!database) return Response.json({ error: "La agenda todavía no tiene conectada su base de datos." }, { status: 503 });
+    const stripeSecret = process.env.STRIPE_SECRET_KEY;
+    if (!stripeSecret) return Response.json({ error: "El pago seguro todavía no está activado. Contacta con Tarot Luna." }, { status: 503 });
+
+    reservationKey = crypto.randomUUID();
+    const response = await fetch(`${database.url}/rest/v1/rpc/create_reservation`, { method: "POST", headers: headers(database.key), body: JSON.stringify({ p_reservation_key: reservationKey, p_name: name, p_email: email, p_phone: phone, p_category: category, p_duration: duration, p_date: date, p_time: time, p_notes: notes.slice(0, 800), p_slot_keys: occupiedKeys(date, time, duration) }) });
     if (!response.ok) {
       const detail = await response.text();
-      if (response.status === 409 || detail.includes("duplicate key")) return Response.json({ error: "Esa franja acaba de ocuparse. Elige otra hora." }, { status: 409 });
+      if (response.status === 409 || detail.includes("23505") || detail.includes("duplicate key") || detail.includes("Franja no disponible")) return Response.json({ error: "Esa franja acaba de ocuparse. Elige otra hora." }, { status: 409 });
       throw new Error(detail);
     }
 
-    const order = `${String(Date.now()).slice(-11)}${randomInt(0, 10)}`;
-    const orderUpdate = await fetch(`${config.url}/rest/v1/reservations?reservation_key=eq.${reservationKey}&status=eq.pending_payment`, {
-      method: "PATCH", headers: { ...headers(config.key), Prefer: "return=representation" },
-      body: JSON.stringify({ payment_order: order, payment_provider: paymentMethod === "bizum" ? "redsys_bizum" : "redsys_card" }),
+    const origin = (process.env.PUBLIC_SITE_URL?.replace(/\/$/, "") || new URL(request.url).origin).replace(/^http:/, "https:");
+    const stripe = new Stripe(stripeSecret);
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment", payment_method_types: ["bizum"], locale: "es", customer_email: email,
+      client_reference_id: reservationKey, metadata: { reservation_key: reservationKey },
+      line_items: [{ quantity: 1, price_data: { currency: "eur", unit_amount: prices[duration], product_data: { name: `Consulta Tarot Luna — ${duration} minutos`, description: `${date} a las ${time}` } } }],
+      success_url: `${origin}/pago/correcto?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/pago/cancelado`, expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
+    }, { idempotencyKey: reservationKey });
+
+    if (!session.url) throw new Error("Stripe no devolvió una dirección de pago");
+    const orderUpdate = await fetch(`${database.url}/rest/v1/reservations?reservation_key=eq.${reservationKey}&status=eq.pending_payment`, {
+      method: "PATCH", headers: { ...headers(database.key), Prefer: "return=representation" },
+      body: JSON.stringify({ payment_order: session.id, payment_provider: "stripe_bizum" }),
     });
     if (!orderUpdate.ok) throw new Error(await orderUpdate.text());
-
-    const origin = (process.env.PUBLIC_SITE_URL?.replace(/\/$/, "") || new URL(request.url).origin).replace(/^http:/, "https:");
-    const amount = duration === 10 ? 1000 : duration === 30 ? 2500 : 5000;
-    const merchantData: Record<string, string> = {
-      DS_MERCHANT_ORDER: order,
-      DS_MERCHANT_MERCHANTCODE: redsys.merchantCode,
-      DS_MERCHANT_TERMINAL: redsys.terminal,
-      DS_MERCHANT_CURRENCY: "978",
-      DS_MERCHANT_TRANSACTIONTYPE: "0",
-      DS_MERCHANT_AMOUNT: String(amount),
-      DS_MERCHANT_MERCHANTURL: `${origin}/api/pagos/redsys/notificacion`,
-      DS_MERCHANT_URLOK: `${origin}/pago/correcto`,
-      DS_MERCHANT_URLKO: `${origin}/pago/cancelado`,
-      DS_MERCHANT_MERCHANTNAME: "Tarot Luna",
-      DS_MERCHANT_PRODUCTDESCRIPTION: `Consulta Tarot Luna - ${duration} minutos`,
-      DS_MERCHANT_TITULAR: name.slice(0, 60),
-    };
-    if (paymentMethod === "bizum") merchantData.DS_MERCHANT_PAYMETHODS = "z";
-    const merchantParameters = encodeMerchantParameters(merchantData);
-    return Response.json({
-      ok: true,
-      reservationKey,
-      payment: {
-        url: redsysEndpoint(redsys.environment),
-        signatureVersion: REDSYS_SIGNATURE_VERSION,
-        merchantParameters,
-        signature: signMerchantParameters(merchantParameters, order, redsys.secretKey),
-      },
-    }, { status: 201 });
+    return Response.json({ ok: true, reservationKey, payment: { url: session.url } }, { status: 201 });
   } catch (error) {
+    if (database && reservationKey) await failPendingReservation(database, reservationKey, "stripe_session_error");
     const message = error instanceof Error ? error.message : "Error inesperado";
     if (message.includes("UNIQUE") || message.includes("booked_slots") || message.includes("reservation_slot_unique")) return Response.json({ error: "Esa franja acaba de ocuparse. Elige otra hora." }, { status: 409 });
-    return Response.json({ error: "No se pudo registrar la reserva. Inténtalo de nuevo." }, { status: 500 });
+    return Response.json({ error: "No se pudo preparar el pago seguro. Inténtalo de nuevo." }, { status: 500 });
   }
 }

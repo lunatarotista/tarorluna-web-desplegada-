@@ -24,7 +24,7 @@ SEGURIDAD
 SIGUIENTE ENDURECIMIENTO
 - Activar TOTP/2FA para el usuario empresarial.
 - Añadir recuperación segura de contraseña.
-- Añadir el flujo bancario automático de Redsys/Bizum y los reembolsos.
+- Añadir el flujo automático de reembolsos desde Stripe.
 
 ACCIONES DE GESTIÓN
 - Ejecuta supabase-admin-actions.sql una sola vez en Supabase > SQL Editor.

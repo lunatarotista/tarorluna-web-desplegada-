@@ -1,4 +1,9 @@
-# vinext-starter
+# Tarot Luna
+
+Web de reservas con Next.js, Supabase, panel privado y pago alojado de Stripe con Bizum.
+
+Consulta primero `00-ACTIVAR-STRIPE-BIZUM.txt`. Las claves reales se configuran únicamente
+como secretos en Vercel; nunca se guardan en este repositorio.
 
 A clean full-stack starter running on
 [vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and

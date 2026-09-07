@@ -1,0 +1,39 @@
+TAROT LUNA — ACTIVAR STRIPE + BIZUM (PRIMERO EN PRUEBAS)
+
+1. SUPABASE
+Ejecuta una vez el archivo supabase-stripe-payments.sql en SQL Editor.
+
+2. STRIPE
+Crea o verifica la cuenta empresarial de Clover Firma SL y activa Bizum en
+Configuración > Métodos de pago. Mantén activado el modo de pruebas.
+
+3. VERCEL > PROYECTO > SETTINGS > ENVIRONMENT VARIABLES
+Conserva SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY y ADMIN_EMAIL.
+Añade como Secret para Production y Preview:
+
+STRIPE_SECRET_KEY = clave secreta de pruebas sk_test_...
+PUBLIC_SITE_URL = https://tarot-luna-empresa.vercel.app
+
+4. WEBHOOK DE STRIPE
+En Stripe > Developers > Webhooks crea un destino HTTPS:
+https://tarot-luna-empresa.vercel.app/api/pagos/stripe/webhook
+
+Eventos que debe recibir:
+- checkout.session.completed
+- checkout.session.async_payment_succeeded
+- checkout.session.async_payment_failed
+- checkout.session.expired
+
+Copia su secreto de firma whsec_... y añádelo en Vercel:
+STRIPE_WEBHOOK_SECRET = whsec_...
+
+5. REDEPLOY Y PRUEBA
+Haz Redeploy después de guardar todas las variables. Realiza únicamente pagos
+de prueba. Comprueba en Supabase que reservations pasa a paid y que booked_slots
+contiene todos los bloques de 10 minutos de la cita.
+
+SEGURIDAD
+- sk_test_/sk_live_ y whsec_ son secretos: nunca se pegan en GitHub ni se envían por chat.
+- La web nunca confía en el navegador para precio o confirmación.
+- Solo el webhook firmado puede confirmar un pago automáticamente.
+- No actives el modo real hasta que Stripe confirme por escrito que admite la actividad.
